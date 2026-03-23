@@ -1,6 +1,7 @@
 """
-AUDIBLE Backend — AI Play Import
-FastAPI service that interprets flag football play diagrams via GPT-4o vision.
+AUDIBLE Backend — AI Play Import + Multi-User Auth
+FastAPI service that interprets flag football play diagrams via GPT-4o vision
+and provides multi-user authentication/team management.
 """
 
 import os
@@ -9,11 +10,17 @@ import re
 import base64
 import json
 import logging
+import sqlite3
+import hashlib
+import time
+import uuid
 from typing import Optional
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+import jwt
+from fastapi import FastAPI, File, UploadFile, HTTPException, Header, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from dotenv import load_dotenv
 from openai import OpenAI
 import fitz  # PyMuPDF
@@ -25,8 +32,8 @@ logger = logging.getLogger("audible-backend")
 
 app = FastAPI(
     title="AUDIBLE Backend",
-    description="AI Play Import — interprets flag football play diagrams via GPT-4o vision",
-    version="1.0.0",
+    description="AI Play Import + Multi-User Auth — Flag Coach IQ",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -40,6 +47,181 @@ app.add_middleware(
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     logger.warning("OPENAI_API_KEY not set — /interpret-play will fail at runtime")
+
+JWT_SECRET = os.getenv("JWT_SECRET", "flagcoachiq-secret-change-in-prod")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRY_DAYS = 30
+DB_PATH = os.getenv("DB_PATH", "flagcoachiq.db")
+
+
+# ─────────────────────────────────────────────
+#  DATABASE INIT
+# ─────────────────────────────────────────────
+
+def get_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = get_db()
+    c = conn.cursor()
+    c.executescript("""
+        CREATE TABLE IF NOT EXISTS teams (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            created_at INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS users (
+            id TEXT PRIMARY KEY,
+            team_id TEXT,
+            name TEXT NOT NULL,
+            email TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'assistant',
+            created_at INTEGER,
+            FOREIGN KEY (team_id) REFERENCES teams(id)
+        );
+
+        CREATE TABLE IF NOT EXISTS invites (
+            id TEXT PRIMARY KEY,
+            team_id TEXT NOT NULL,
+            email TEXT NOT NULL,
+            role TEXT NOT NULL,
+            token TEXT UNIQUE NOT NULL,
+            used INTEGER DEFAULT 0,
+            created_at INTEGER,
+            expires_at INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id TEXT PRIMARY KEY,
+            team_id TEXT,
+            user_id TEXT,
+            user_name TEXT,
+            action TEXT,
+            item_type TEXT,
+            item_name TEXT,
+            timestamp INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS team_data (
+            id TEXT PRIMARY KEY,
+            team_id TEXT NOT NULL,
+            data_type TEXT NOT NULL,
+            data_json TEXT NOT NULL,
+            updated_by TEXT,
+            updated_at INTEGER,
+            UNIQUE(team_id, data_type)
+        );
+    """)
+    conn.commit()
+    conn.close()
+    logger.info("Database initialized: %s", DB_PATH)
+
+
+init_db()
+
+
+# ─────────────────────────────────────────────
+#  JWT HELPERS
+# ─────────────────────────────────────────────
+
+def create_token(user_id: str) -> str:
+    payload = {
+        "sub": user_id,
+        "iat": int(time.time()),
+        "exp": int(time.time()) + (JWT_EXPIRY_DAYS * 86400),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+def verify_token(token: str) -> dict:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+def get_current_user(authorization: Optional[str] = Header(None)) -> dict:
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    token = authorization.split(" ", 1)[1]
+    payload = verify_token(token)
+    user_id = payload.get("sub")
+    conn = get_db()
+    row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=401, detail="User not found")
+    return dict(row)
+
+
+def require_head_coach(user: dict = Depends(get_current_user)) -> dict:
+    if user["role"] != "head_coach":
+        raise HTTPException(status_code=403, detail="Head Coach access required")
+    return user
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def row_to_user(row) -> dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "email": row["email"],
+        "role": row["role"],
+        "team_id": row["team_id"],
+        "created_at": row["created_at"],
+    }
+
+
+def row_to_team(row) -> dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "created_at": row["created_at"],
+    }
+
+
+# ─────────────────────────────────────────────
+#  PYDANTIC MODELS
+# ─────────────────────────────────────────────
+
+class RegisterBody(BaseModel):
+    team_name: str
+    name: str
+    email: str
+    password: str
+
+class LoginBody(BaseModel):
+    email: str
+    password: str
+
+class AcceptInviteBody(BaseModel):
+    token: str
+    name: str
+    password: str
+
+class SendInviteBody(BaseModel):
+    email: str
+    role: str  # 'coordinator' | 'assistant'
+
+class TeamDataBody(BaseModel):
+    data: list
+
+class UpdateRoleBody(BaseModel):
+    role: str
+
+class UpdateTeamBody(BaseModel):
+    name: str
 
 VISION_PROMPT = """You are a football play diagram interpreter. Analyze this flag football play diagram and extract:
 1. Player positions (offense and defense) as normalized x,y coordinates (0.0-1.0) from top-left
@@ -164,12 +346,310 @@ def validate_and_normalize(data: dict) -> dict:
 
 
 # ─────────────────────────────────────────────
-#  ROUTES
+#  ROUTES — HEALTH
 # ─────────────────────────────────────────────
 
 @app.get("/")
 async def health_check():
-    return {"status": "ok", "service": "AUDIBLE Backend", "version": "1.0.0"}
+    return {"status": "ok", "service": "AUDIBLE Backend", "version": "2.0.0"}
+
+
+# ─────────────────────────────────────────────
+#  ROUTES — AUTH
+# ─────────────────────────────────────────────
+
+@app.post("/auth/register")
+async def register(body: RegisterBody):
+    """Create a new team and head coach account."""
+    conn = get_db()
+    # Check if email already exists
+    existing = conn.execute("SELECT id FROM users WHERE email = ?", (body.email.lower().strip(),)).fetchone()
+    if existing:
+        conn.close()
+        raise HTTPException(status_code=409, detail="An account with that email already exists")
+
+    now = int(time.time())
+    team_id = str(uuid.uuid4())
+    user_id = str(uuid.uuid4())
+
+    conn.execute(
+        "INSERT INTO teams (id, name, created_at) VALUES (?, ?, ?)",
+        (team_id, body.team_name.strip(), now)
+    )
+    conn.execute(
+        "INSERT INTO users (id, team_id, name, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, team_id, body.name.strip(), body.email.lower().strip(), hash_password(body.password), "head_coach", now)
+    )
+    conn.commit()
+
+    user_row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    team_row = conn.execute("SELECT * FROM teams WHERE id = ?", (team_id,)).fetchone()
+    conn.close()
+
+    token = create_token(user_id)
+    logger.info("New team registered: %s by %s", body.team_name, body.email)
+    return {"token": token, "user": row_to_user(user_row), "team": row_to_team(team_row)}
+
+
+@app.post("/auth/login")
+async def login(body: LoginBody):
+    """Login with email + password."""
+    conn = get_db()
+    user_row = conn.execute("SELECT * FROM users WHERE email = ?", (body.email.lower().strip(),)).fetchone()
+    if not user_row or user_row["password_hash"] != hash_password(body.password):
+        conn.close()
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+
+    team_row = conn.execute("SELECT * FROM teams WHERE id = ?", (user_row["team_id"],)).fetchone()
+    conn.close()
+
+    token = create_token(user_row["id"])
+    logger.info("Login: %s", body.email)
+    return {"token": token, "user": row_to_user(user_row), "team": row_to_team(team_row) if team_row else None}
+
+
+@app.get("/auth/me")
+async def get_me(current_user: dict = Depends(get_current_user)):
+    """Get current user info."""
+    conn = get_db()
+    team_row = conn.execute("SELECT * FROM teams WHERE id = ?", (current_user["team_id"],)).fetchone()
+    conn.close()
+    return {"user": current_user, "team": row_to_team(team_row) if team_row else None}
+
+
+# ─────────────────────────────────────────────
+#  ROUTES — INVITES
+# ─────────────────────────────────────────────
+
+@app.post("/invites/send")
+async def send_invite(body: SendInviteBody, current_user: dict = Depends(require_head_coach)):
+    """Send an invite (Head Coach only). Returns the join URL."""
+    if body.role not in ("coordinator", "assistant"):
+        raise HTTPException(status_code=400, detail="Role must be 'coordinator' or 'assistant'")
+
+    conn = get_db()
+    now = int(time.time())
+    invite_id = str(uuid.uuid4())
+    token = str(uuid.uuid4()).replace("-", "")
+    expires_at = now + (7 * 86400)  # 7 days
+
+    conn.execute(
+        "INSERT INTO invites (id, team_id, email, role, token, used, created_at, expires_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+        (invite_id, current_user["team_id"], body.email.lower().strip(), body.role, token, now, expires_at)
+    )
+    conn.commit()
+    conn.close()
+
+    join_url = f"https://flagcoachiq.app/join?token={token}"
+    logger.info("Invite sent for %s (role: %s) by %s", body.email, body.role, current_user["email"])
+    return {"invite_token": token, "join_url": join_url, "email": body.email, "role": body.role}
+
+
+@app.post("/invites/accept")
+async def accept_invite(body: AcceptInviteBody):
+    """Accept an invite and create an account."""
+    conn = get_db()
+    invite = conn.execute(
+        "SELECT * FROM invites WHERE token = ? AND used = 0",
+        (body.token,)
+    ).fetchone()
+
+    if not invite:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Invalid or expired invite token")
+
+    now = int(time.time())
+    if invite["expires_at"] < now:
+        conn.close()
+        raise HTTPException(status_code=410, detail="This invite has expired")
+
+    # Check if email already registered
+    existing = conn.execute("SELECT id FROM users WHERE email = ?", (invite["email"],)).fetchone()
+    if existing:
+        conn.close()
+        raise HTTPException(status_code=409, detail="An account with this email already exists")
+
+    user_id = str(uuid.uuid4())
+    conn.execute(
+        "INSERT INTO users (id, team_id, name, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (user_id, invite["team_id"], body.name.strip(), invite["email"], hash_password(body.password), invite["role"], now)
+    )
+    conn.execute("UPDATE invites SET used = 1 WHERE id = ?", (invite["id"],))
+    conn.commit()
+
+    user_row = conn.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+    team_row = conn.execute("SELECT * FROM teams WHERE id = ?", (invite["team_id"],)).fetchone()
+    conn.close()
+
+    token = create_token(user_id)
+    logger.info("Invite accepted by %s for team %s", invite["email"], invite["team_id"])
+    return {"token": token, "user": row_to_user(user_row), "team": row_to_team(team_row)}
+
+
+@app.get("/invites/list")
+async def list_invites(current_user: dict = Depends(require_head_coach)):
+    """List all pending invites for the team."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM invites WHERE team_id = ? AND used = 0 ORDER BY created_at DESC",
+        (current_user["team_id"],)
+    ).fetchall()
+    conn.close()
+    return {"invites": [dict(r) for r in rows]}
+
+
+@app.delete("/invites/{invite_id}")
+async def revoke_invite(invite_id: str, current_user: dict = Depends(require_head_coach)):
+    """Revoke a pending invite."""
+    conn = get_db()
+    conn.execute(
+        "DELETE FROM invites WHERE id = ? AND team_id = ?",
+        (invite_id, current_user["team_id"])
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
+# ─────────────────────────────────────────────
+#  ROUTES — TEAM DATA
+# ─────────────────────────────────────────────
+
+VALID_DATA_TYPES = {"plays", "players", "games", "practices", "notes", "customDrills"}
+
+
+@app.get("/data/{data_type}")
+async def get_data(data_type: str, current_user: dict = Depends(get_current_user)):
+    """Get team data for a given type."""
+    if data_type not in VALID_DATA_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid data type. Must be one of: {', '.join(VALID_DATA_TYPES)}")
+
+    conn = get_db()
+    row = conn.execute(
+        "SELECT data_json FROM team_data WHERE team_id = ? AND data_type = ?",
+        (current_user["team_id"], data_type)
+    ).fetchone()
+    conn.close()
+
+    if row:
+        try:
+            data = json.loads(row["data_json"])
+        except Exception:
+            data = []
+    else:
+        data = []
+
+    return {"data": data, "data_type": data_type}
+
+
+@app.post("/data/{data_type}")
+async def save_data(data_type: str, body: TeamDataBody, current_user: dict = Depends(get_current_user)):
+    """Save/overwrite team data for a given type. Logs activity."""
+    if data_type not in VALID_DATA_TYPES:
+        raise HTTPException(status_code=400, detail=f"Invalid data type. Must be one of: {', '.join(VALID_DATA_TYPES)}")
+
+    now = int(time.time())
+    conn = get_db()
+
+    # Upsert team data
+    conn.execute("""
+        INSERT INTO team_data (id, team_id, data_type, data_json, updated_by, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(team_id, data_type) DO UPDATE SET
+            data_json = excluded.data_json,
+            updated_by = excluded.updated_by,
+            updated_at = excluded.updated_at
+    """, (str(uuid.uuid4()), current_user["team_id"], data_type, json.dumps(body.data), current_user["id"], now))
+
+    # Log activity
+    conn.execute(
+        "INSERT INTO activity_log (id, team_id, user_id, user_name, action, item_type, item_name, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (str(uuid.uuid4()), current_user["team_id"], current_user["id"], current_user["name"],
+         "saved", data_type, f"{len(body.data)} items", now)
+    )
+    conn.commit()
+    conn.close()
+
+    return {"ok": True, "data_type": data_type, "count": len(body.data)}
+
+
+@app.get("/activity")
+async def get_activity(current_user: dict = Depends(get_current_user)):
+    """Get last 50 activity log entries for the team."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM activity_log WHERE team_id = ? ORDER BY timestamp DESC LIMIT 50",
+        (current_user["team_id"],)
+    ).fetchall()
+    conn.close()
+    return {"activity": [dict(r) for r in rows]}
+
+
+# ─────────────────────────────────────────────
+#  ROUTES — ADMIN
+# ─────────────────────────────────────────────
+
+@app.get("/admin/staff")
+async def list_staff(current_user: dict = Depends(require_head_coach)):
+    """List all team members (Head Coach only)."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM users WHERE team_id = ? ORDER BY created_at ASC",
+        (current_user["team_id"],)
+    ).fetchall()
+    conn.close()
+    return {"staff": [row_to_user(r) for r in rows]}
+
+
+@app.patch("/admin/staff/{user_id}")
+async def update_staff_role(user_id: str, body: UpdateRoleBody, current_user: dict = Depends(require_head_coach)):
+    """Update a staff member's role (Head Coach only)."""
+    if body.role not in ("head_coach", "coordinator", "assistant"):
+        raise HTTPException(status_code=400, detail="Invalid role")
+    if user_id == current_user["id"]:
+        raise HTTPException(status_code=400, detail="You cannot change your own role")
+
+    conn = get_db()
+    result = conn.execute(
+        "UPDATE users SET role = ? WHERE id = ? AND team_id = ?",
+        (body.role, user_id, current_user["team_id"])
+    )
+    conn.commit()
+    conn.close()
+
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Staff member not found")
+    return {"ok": True}
+
+
+@app.delete("/admin/staff/{user_id}")
+async def remove_staff(user_id: str, current_user: dict = Depends(require_head_coach)):
+    """Remove a staff member from the team (Head Coach only)."""
+    if user_id == current_user["id"]:
+        raise HTTPException(status_code=400, detail="You cannot remove yourself")
+
+    conn = get_db()
+    result = conn.execute(
+        "DELETE FROM users WHERE id = ? AND team_id = ?",
+        (user_id, current_user["team_id"])
+    )
+    conn.commit()
+    conn.close()
+
+    if result.rowcount == 0:
+        raise HTTPException(status_code=404, detail="Staff member not found")
+    return {"ok": True}
+
+
+@app.patch("/admin/team")
+async def update_team(body: UpdateTeamBody, current_user: dict = Depends(require_head_coach)):
+    """Update team name (Head Coach only)."""
+    conn = get_db()
+    conn.execute("UPDATE teams SET name = ? WHERE id = ?", (body.name.strip(), current_user["team_id"]))
+    conn.commit()
+    team_row = conn.execute("SELECT * FROM teams WHERE id = ?", (current_user["team_id"],)).fetchone()
+    conn.close()
+    return {"team": row_to_team(team_row)}
 
 
 @app.post("/interpret-play")
