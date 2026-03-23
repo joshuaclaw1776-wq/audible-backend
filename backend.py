@@ -118,6 +118,13 @@ def init_db():
             UNIQUE(team_id, data_type)
         );
     """)
+
+    # Ensure invites table has name column for existing databases
+    try:
+        c.execute("ALTER TABLE invites ADD COLUMN name TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
     logger.info("Database initialized: %s", DB_PATH)
