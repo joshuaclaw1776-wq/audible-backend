@@ -90,6 +90,7 @@ def init_db():
             team_id TEXT NOT NULL,
             email TEXT NOT NULL,
             role TEXT NOT NULL,
+            name TEXT DEFAULT '',
             token TEXT UNIQUE NOT NULL,
             used INTEGER DEFAULT 0,
             created_at INTEGER,
@@ -212,7 +213,8 @@ class AcceptInviteBody(BaseModel):
 
 class SendInviteBody(BaseModel):
     email: str
-    role: str  # 'coordinator' | 'assistant'
+    role: str  # 'head_coach' | 'coordinator' | 'assistant'
+    name: str = ""  # Pre-set coach name (optional)
 
 class TeamDataBody(BaseModel):
     data: list
@@ -424,8 +426,8 @@ async def get_me(current_user: dict = Depends(get_current_user)):
 @app.post("/invites/send")
 async def send_invite(body: SendInviteBody, current_user: dict = Depends(require_head_coach)):
     """Send an invite (Head Coach only). Returns the join URL."""
-    if body.role not in ("coordinator", "assistant"):
-        raise HTTPException(status_code=400, detail="Role must be 'coordinator' or 'assistant'")
+    if body.role not in ("head_coach", "coordinator", "assistant"):
+        raise HTTPException(status_code=400, detail="Role must be 'head_coach', 'coordinator' or 'assistant'")
 
     conn = get_db()
     now = int(time.time())
@@ -433,16 +435,17 @@ async def send_invite(body: SendInviteBody, current_user: dict = Depends(require
     token = str(uuid.uuid4()).replace("-", "")
     expires_at = now + (7 * 86400)  # 7 days
 
+    preset_name = body.name.strip() if body.name else ""
     conn.execute(
-        "INSERT INTO invites (id, team_id, email, role, token, used, created_at, expires_at) VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
-        (invite_id, current_user["team_id"], body.email.lower().strip(), body.role, token, now, expires_at)
+        "INSERT INTO invites (id, team_id, email, role, name, token, used, created_at, expires_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
+        (invite_id, current_user["team_id"], body.email.lower().strip(), body.role, preset_name, token, now, expires_at)
     )
     conn.commit()
     conn.close()
 
     join_url = f"https://flagcoachiq.app/join?token={token}"
     logger.info("Invite sent for %s (role: %s) by %s", body.email, body.role, current_user["email"])
-    return {"invite_token": token, "join_url": join_url, "email": body.email, "role": body.role}
+    return {"invite_token": token, "join_url": join_url, "email": body.email, "role": body.role, "name": preset_name}
 
 
 @app.post("/invites/accept")
@@ -457,6 +460,9 @@ async def accept_invite(body: AcceptInviteBody):
     if not invite:
         conn.close()
         raise HTTPException(status_code=404, detail="Invalid or expired invite token")
+    
+    # Return invite preview (name/role) without full accept — for GET preview
+    
 
     now = int(time.time())
     if invite["expires_at"] < now:
@@ -485,6 +491,27 @@ async def accept_invite(body: AcceptInviteBody):
     logger.info("Invite accepted by %s for team %s", invite["email"], invite["team_id"])
     return {"token": token, "user": row_to_user(user_row), "team": row_to_team(team_row)}
 
+
+@app.get("/invites/preview/{token}")
+async def preview_invite(token: str):
+    """Preview invite details (name, role, team) before accepting — no auth required."""
+    conn = get_db()
+    invite = conn.execute("SELECT * FROM invites WHERE token = ? AND used = 0", (token,)).fetchone()
+    if not invite:
+        conn.close()
+        raise HTTPException(status_code=404, detail="Invalid or expired invite token")
+    now = int(time.time())
+    if invite["expires_at"] < now:
+        conn.close()
+        raise HTTPException(status_code=410, detail="This invite has expired")
+    team = conn.execute("SELECT name FROM teams WHERE id = ?", (invite["team_id"],)).fetchone()
+    conn.close()
+    return {
+        "email": invite["email"],
+        "role": invite["role"],
+        "name": invite["name"] or "",
+        "team_name": team["name"] if team else "Your Team"
+    }
 
 @app.get("/invites/list")
 async def list_invites(current_user: dict = Depends(require_head_coach)):
@@ -606,8 +633,7 @@ async def update_staff_role(user_id: str, body: UpdateRoleBody, current_user: di
     """Update a staff member's role (Head Coach only)."""
     if body.role not in ("head_coach", "coordinator", "assistant"):
         raise HTTPException(status_code=400, detail="Invalid role")
-    if user_id == current_user["id"]:
-        raise HTTPException(status_code=400, detail="You cannot change your own role")
+    # Allow head coaches to change any role including their own (multiple head coaches supported)
 
     conn = get_db()
     result = conn.execute(
