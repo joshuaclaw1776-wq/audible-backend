@@ -890,3 +890,117 @@ Text:
         })
 
     return {"players": normalized, "count": len(normalized)}
+
+
+@app.post("/analyze-play")
+async def analyze_play(request: Request):
+    """
+    Analyze an offensive flag football play against defensive coverages.
+    """
+    import json as json_module
+    body = await request.json()
+
+    play_name = body.get('name', 'Unknown Play')
+    play_type = body.get('type', 'pass')
+    play_notes = body.get('notes', '')
+    play_format = body.get('format', 'both')
+    routes_desc = body.get('routes_description', '')
+
+    system_prompt = """You are an expert flag football offensive coordinator with deep knowledge of all defensive coverages used in 5v5 and 7v7 flag football. 
+
+You understand these defensive coverages:
+- Man Coverage (Cover 0): Each defender locks onto one receiver. No help over top. Vulnerable to double moves, pick routes, rub routes, and speed mismatches.
+- Cover 2: Two deep safeties splitting the field in half. 3-4 underneath zone defenders. Vulnerable to the seam route, post route, flood concepts, and corner routes. Strong against deep single routes.
+- Cover 3: Three deep defenders (2 corners + 1 safety) each owning a third of the field. Underneath defenders play flat/hook zones. Vulnerable to flood concepts, 4-verticals, crossing routes, and curl-flat combos.
+- Cover 4 (Quarters): Four defenders playing deep quarters coverage. Very deep prevent. Vulnerable to short and intermediate routes, screen passes, crossing routes, and anything underneath.
+- Zone Blitz: One or more rushers sent while remaining defenders drop into zone. Vulnerable to hot routes, quick slants, screens, and bubble routes. Can disrupt timing.
+- All-Out Blitz (Cover 0 Blitz): Max pressure, no help. Extremely vulnerable to quick releases, pre-snap reads, hot routes, and any receiver who beats their man.
+- 2-3 Zone: Two deep, three underneath. Common in 5v5. Vulnerable to flood routes, verticals in the seams, and aggressive route running in the flats.
+- 3-2 Zone: Three deep, two underneath. Vulnerable to short crossing routes, quick slants, and curl routes.
+- Cover 1 (Man Free): Man coverage with one free safety in the middle. Vulnerable to pick routes, rub routes, crossers, and flood to the boundary away from the safety.
+- Press Man: Defenders jam receivers at the line. Vulnerable to speed releases, fade routes, double moves, and any WR with a speed advantage.
+
+**7v7-Specific Coverages:**
+- Cover 2 Man (2 deep safeties + 5 man coverage underneath): Common 7v7 look. Vulnerable to crossing routes, rub/pick combos, and flood concepts that stress the safeties laterally.
+- Tampa 2 (Cover 2 with MLB/center defender dropping to deep middle): Closes off the seam but leaves the flats and the boundary side open. Vulnerable to out routes, corner routes, and flooding to one side.
+- Cover 6 (Quarter-Quarter-Half: Cover 4 to one side, Cover 2 to other): Disguise coverage that shows different looks pre-snap. Vulnerable to attacking the Cover 2 half with flood routes or the boundary corner route.
+- 5-1 Zone (5 zone defenders, 1 rusher): Most common base 7v7 zone look. Vulnerable to flooding zones, clearing routes that occupy underneath defenders, and vertical routes into vacated zones.
+- 5-2 Defense (5 zone defenders, 2 rushers): Aggressive with double rush. Vulnerable to hot routes, quick slants, bubble screens, and any pre-snap adjustments to attack the rushers' vacated zones.
+- 4-3 Man (4 DBs in man, 3 rushers): Max pressure man. Extremely vulnerable to quick releases, pre-snap reads, pick routes, and screens. The triple rush creates openings if neutralized.
+- 3-3-1 Defense (3 underneath zone, 3 mid zone, 1 deep safety): Popular 7v7 hybrid. Vulnerable to seam routes splitting the zones and deep over routes that stress the single safety.
+- Cloud Coverage (corner plays off-zone, safety rotates to his side): Designed to protect against the deep ball. Vulnerable to fade routes, back-shoulder throws, and quick hitch routes in front of the soft corner.
+- Bracket Coverage (two defenders bracketing the top WR): Takes away the star receiver. Vulnerable to leaving other receivers in single coverage — attack the other side of the field aggressively.
+
+For each play analysis, consider:
+- The play type (pass/run/defense/special)
+- Route combinations and how they stress different coverage shells
+- Formation strength/weakness vs coverage
+- Flag football specific rules (no-run zones, QB can't run unless rusher crosses)
+"""
+
+    format_note = "This is a 7v7 flag football play — prioritize 7v7-specific coverages (Cover 2 Man, Tampa 2, Cover 6, 5-1 Zone, 5-2, 4-3 Man, 3-3-1, Cloud, Bracket) in your analysis." if play_format == "7v7" else "This is a 5v5 flag football play — focus on 5v5 coverages (Man, Cover 2, Cover 3, Zone Blitz, 2-3 Zone, 3-2 Zone, All-Out Blitz)." if play_format == "5v5" else "This play works in both 5v5 and 7v7 — analyze against the full range of flag football coverages including 7v7-specific looks."
+
+    user_prompt = f"""Analyze this flag football offensive play:
+
+Play Name: {play_name}
+Play Type: {play_type}
+Format: {play_format}
+Format Note: {format_note}
+Coach's Notes: {play_notes if play_notes else 'None provided'}
+Route/Formation Description: {routes_desc if routes_desc else 'Standard formation'}
+
+Provide a detailed coverage matchup analysis. Return ONLY valid JSON in this exact format:
+{{
+  "play_name": "{play_name}",
+  "summary": "One sentence describing what this play is designed to do",
+  "strong_against": [
+    {{
+      "coverage": "Coverage name",
+      "rating": 5,
+      "reason": "Specific explanation of why this play beats this coverage in flag football"
+    }},
+    {{
+      "coverage": "Coverage name",
+      "rating": 4,
+      "reason": "Explanation"
+    }},
+    {{
+      "coverage": "Coverage name",
+      "rating": 3,
+      "reason": "Explanation"
+    }}
+  ],
+  "weak_against": [
+    {{
+      "coverage": "Coverage name",
+      "rating": 2,
+      "reason": "Why this coverage gives this play trouble"
+    }},
+    {{
+      "coverage": "Coverage name",
+      "rating": 1,
+      "reason": "Why this is a difficult matchup"
+    }}
+  ],
+  "adjustment": "Specific coaching tip: what route or formation tweak makes this play work against its weak coverages",
+  "ideal_situation": "Best game situation to call this play (down, distance, field position, score scenario)",
+  "danger_coverage": "The single most dangerous coverage to face with this play",
+  "best_matchup": "The single best coverage to attack with this play"
+}}"""
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            max_tokens=1000,
+            temperature=0.3
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r'^```json\s*|\s*```$', '', raw, flags=re.MULTILINE)
+        analysis = json_module.loads(raw)
+        return analysis
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"AI analysis unavailable: {str(e)}")
