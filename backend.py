@@ -5,6 +5,7 @@ FastAPI service that interprets flag football play diagrams via GPT-4o vision.
 
 import os
 import io
+import re
 import base64
 import json
 import logging
@@ -241,3 +242,171 @@ async def interpret_play(file: UploadFile = File(...)):
         result["name"], result["type"], len(result["players"]), len(result["routes"])
     )
     return JSONResponse(content=result)
+
+
+@app.post("/import-roster")
+async def import_roster(file: UploadFile = File(...)):
+    """
+    Accept CSV, XLSX, PDF, or image roster files.
+    Extract player data using GPT-4o or direct parsing.
+    Returns structured list of players.
+    """
+    if not OPENAI_API_KEY:
+        raise HTTPException(status_code=503, detail="OpenAI API key not configured")
+
+    content = await file.read()
+    filename = file.filename.lower()
+
+    # Guard: 10MB max
+    if len(content) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File too large. Max 10MB.")
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    players = []
+
+    # ── CSV / plain text ──────────────────────────────
+    if filename.endswith('.csv') or file.content_type in ('text/csv', 'text/plain'):
+        import csv
+        text = content.decode('utf-8', errors='ignore')
+        reader = csv.DictReader(io.StringIO(text))
+        raw_rows = list(reader)
+
+        # Use GPT to normalize headers and extract fields
+        prompt = f"""You are a sports roster parser. Given this CSV data, extract player information.
+Return a JSON array where each player object has these fields (use null if unknown):
+- name (string, full name)
+- number (string, jersey number)
+- position (string, one of: QB, WR, RB, C, DB, LB, TE, K, or best match)
+- format (string: "5v5", "7v7", or "both")
+- status (string: "active", "injured", or "active" as default)
+- notes (string, any extra info, or "")
+
+CSV data:
+{text[:3000]}
+
+Return ONLY valid JSON array. No explanation."""
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=2000,
+            temperature=0.1
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r'^```json\s*|\s*```$', '', raw, flags=re.MULTILINE)
+        players = json.loads(raw)
+
+    # ── XLSX ──────────────────────────────────────────
+    elif filename.endswith('.xlsx') or filename.endswith('.xls'):
+        try:
+            import openpyxl
+            wb = openpyxl.load_workbook(io.BytesIO(content), data_only=True)
+            ws = wb.active
+            rows = []
+            for row in ws.iter_rows(values_only=True):
+                if any(cell is not None for cell in row):
+                    rows.append([str(c) if c is not None else '' for c in row])
+
+            text = '\n'.join([','.join(row) for row in rows])
+            prompt = f"""You are a sports roster parser. Given this spreadsheet data, extract player information.
+Return a JSON array where each player has: name, number, position (QB/WR/RB/C/DB/LB/TE or best match), format ("5v5"/"7v7"/"both"), status ("active"/"injured"), notes.
+Use null for unknown fields. Default status to "active", format to "both".
+
+Data:
+{text[:3000]}
+
+Return ONLY valid JSON array."""
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=2000, temperature=0.1
+            )
+            raw = response.choices[0].message.content.strip()
+            raw = re.sub(r'^```json\s*|\s*```$', '', raw, flags=re.MULTILINE)
+            players = json.loads(raw)
+        except ImportError:
+            raise HTTPException(status_code=400, detail="Excel support not available. Please upload a CSV instead.")
+
+    # ── PDF ───────────────────────────────────────────
+    elif filename.endswith('.pdf') or file.content_type == 'application/pdf':
+        doc = fitz.open(stream=content, filetype="pdf")
+        text = ""
+        for page in doc:
+            text += page.get_text()
+        doc.close()
+
+        if text.strip():
+            # Text-based PDF
+            prompt = f"""You are a sports roster parser. Extract all player data from this text.
+Return a JSON array where each player has: name, number, position (QB/WR/RB/C/DB/LB/TE or best match), format ("5v5"/"7v7"/"both"), status ("active"), notes ("").
+Default format to "both". Return ONLY valid JSON array.
+
+Text:
+{text[:3000]}"""
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=2000, temperature=0.1
+            )
+            raw = response.choices[0].message.content.strip()
+            raw = re.sub(r'^```json\s*|\s*```$', '', raw, flags=re.MULTILINE)
+            players = json.loads(raw)
+        else:
+            # Scanned PDF — render first page as image and use vision
+            page = fitz.open(stream=content, filetype="pdf")[0]
+            pix = page.get_pixmap(dpi=150)
+            img_bytes = pix.tobytes("png")
+            b64 = base64.b64encode(img_bytes).decode()
+
+            response = client.chat.completions.create(
+                model="gpt-4o",
+                messages=[{"role": "user", "content": [
+                    {"type": "text", "text": "This is a scanned sports roster. Extract all player data and return a JSON array where each player has: name, number, position (QB/WR/RB/C/DB/LB/TE), format ('both'), status ('active'), notes (''). Return ONLY valid JSON array."},
+                    {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}", "detail": "high"}}
+                ]}],
+                max_tokens=2000
+            )
+            raw = response.choices[0].message.content.strip()
+            raw = re.sub(r'^```json\s*|\s*```$', '', raw, flags=re.MULTILINE)
+            players = json.loads(raw)
+
+    # ── IMAGE (photo of roster) ────────────────────────
+    elif file.content_type and file.content_type.startswith('image/'):
+        b64 = base64.b64encode(content).decode()
+        ext = filename.split('.')[-1] if '.' in filename else 'jpeg'
+        mime = f"image/{ext}"
+
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": [
+                {"type": "text", "text": "This is a photo of a sports roster list. Extract all visible player information and return a JSON array where each player has: name (string), number (string or null), position (QB/WR/RB/C/DB/LB/TE or null), format ('both'), status ('active'), notes (''). Return ONLY valid JSON array, no explanation."},
+                {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}", "detail": "high"}}
+            ]}],
+            max_tokens=2000
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r'^```json\s*|\s*```$', '', raw, flags=re.MULTILINE)
+        players = json.loads(raw)
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.content_type}. Upload CSV, XLSX, PDF, or an image.")
+
+    # Normalize and validate player objects
+    valid_positions = {'QB','WR','RB','C','DB','LB','TE','K','ATH'}
+    normalized = []
+    for p in players:
+        if not isinstance(p, dict): continue
+        name = str(p.get('name') or '').strip()
+        if not name or name.lower() in ('null','none',''): continue
+        pos = str(p.get('position') or 'ATH').upper().strip()
+        if pos not in valid_positions: pos = 'ATH'
+        normalized.append({
+            'name': name,
+            'number': str(p.get('number') or '').strip() or None,
+            'position': pos,
+            'format': p.get('format') or 'both',
+            'status': p.get('status') or 'active',
+            'notes': str(p.get('notes') or '').strip()
+        })
+
+    return {"players": normalized, "count": len(normalized)}

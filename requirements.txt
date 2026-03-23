@@ -4,3 +4,4 @@ openai
 python-dotenv
 pymupdf
 python-multipart
+openpyxl
